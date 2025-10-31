@@ -156,36 +156,38 @@ double compute_loss(const Data& d, const std::vector<double>& w) {
 
 double one_iter(Data& d, std::vector<double>& w, double lr, bool need_loss, double* out_loss) {
     auto t0 = std::chrono::high_resolution_clock::now();
-    double sse = compute_loss(d, w);
-    int N = d.N;  
-    int D = d.D;
+    int N = d.N, D = d.D;
 
     std::fill(d.grad.begin(), d.grad.end(), 0.0);
+    double sse = 0.0;
+
 #pragma omp parallel
     {
         std::vector<double> gl(D, 0.0);
+        double sse_local = 0.0;
+
 #pragma omp for nowait
         for (int i = 0; i < N; ++i) {
             const double* Xi = &d.X[(size_t)i * D];
-            double ri = d.r[i];
-            for (int j = 0; j < D; ++j)
-                gl[j] += Xi[j] * ri;
+            double pred = 0.0;
+            for (int j = 0; j < D; ++j) pred += Xi[j] * w[j];
+            double ri = pred - d.y[i];
+            if (need_loss) sse_local += ri * ri;
+            for (int j = 0; j < D; ++j) gl[j] += Xi[j] * ri;
         }
+
 #pragma omp critical
         {
-            for (int j = 0; j < D; ++j)
-                d.grad[j] += gl[j];
+            for (int j = 0; j < D; ++j) d.grad[j] += gl[j];
+            sse += sse_local;
         }
     }
+
     double scale = 2.0 / N;
-    for (int j = 0; j < D; ++j)
-        d.grad[j] *= scale;
-    for (int j = 0; j < D; ++j)
-        w[j] -= lr * d.grad[j];
+    for (int j = 0; j < D; ++j) w[j] -= lr * (scale * d.grad[j]);
+
     auto t1 = std::chrono::high_resolution_clock::now();
-    if (out_loss)
-        //*out_loss = need_loss ? (sse / N) : std::numeric_limits<double>::quiet_NaN();
-        *out_loss = need_loss ? sse : std::numeric_limits<double>::quiet_NaN();
+    if (out_loss) *out_loss = need_loss ? (sse / N) : std::numeric_limits<double>::quiet_NaN();
     return std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
 

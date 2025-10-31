@@ -1,6 +1,8 @@
 import os, sys, subprocess, glob
 import tkinter as tk
 from tkinter import ttk, filedialog
+
+import numpy as np
 import pandas as pd
 import matplotlib
 
@@ -398,11 +400,13 @@ class App(tk.Tk):
                 ]
                 series_list = []
                 used_files = []
+                means = []
                 for p in selected:
                     try:
                         dfi = pd.read_csv(p)
                         if "iter_idx" in dfi.columns and "time_ms" in dfi.columns:
                             s = dfi.set_index("iter_idx")["time_ms"]
+                            means.append(s.mean())
                             series_list.append(s)
                             used_files.append(p)
                         else:
@@ -419,7 +423,7 @@ class App(tk.Tk):
                     )
                 else:
                     df_concat = pd.concat(series_list, axis=1)
-                    mean_series = df_concat.mean(axis=1, skipna=True).sort_index()
+                    mean_series = df_concat.median(axis=1, skipna=True).sort_index()
                     self.ax.plot(
                         mean_series.index, mean_series.values, marker=".", linewidth=1
                     )
@@ -432,6 +436,7 @@ class App(tk.Tk):
                     lines.append(
                         f"Averaged per-iter from {len(used_files)} files (requested {runs_needed})"
                     )
+                    lines.append(f"Median per-iter time: {np.median(means)}")
 
         self.left.delete("1.0", tk.END)
         self.left.insert(tk.END, "\n".join(lines))

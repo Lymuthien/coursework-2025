@@ -356,7 +356,6 @@ class App(tk.Tk):
 
         base = os.path.splitext(self.vars["per_iter"].get().strip())[0]
         files = glob.glob(base + "_run*.csv")
-        latest = max(files, key=lambda p: os.path.getmtime(p)) if files else None
 
         self.ax.clear()
 
@@ -376,31 +375,63 @@ class App(tk.Tk):
                     self.ax.set_ylabel("Total time, ms")
                     self.ax.grid(True)
                 else:
-                    self.ax.text(
-                        0.5, 0.5, "No data for threads→time", ha="center"
-                    )
+                    self.ax.text(0.5, 0.5, "No data for threads→time", ha="center")
             except Exception as e:
                 self.ax.text(0.5, 0.5, f"Error: {e}", ha="center")
         else:
-            if latest:
+            try:
+                runs_needed = int(self.vars["runs"].get())
+            except:
                 try:
-                    dfi = pd.read_csv(latest)
-                    if "iter_idx" in dfi and "time_ms" in dfi:
-                        self.ax.plot(
-                            dfi["iter_idx"], dfi["time_ms"], marker=".", linewidth=1
-                        )
-                        self.ax.set_title("Per-iteration time (last session)")
-                        self.ax.set_xlabel("Iteration")
-                        self.ax.set_ylabel("ms")
-                        self.ax.grid(True)
-                    else:
-                        self.ax.text(
-                            0.5, 0.5, "per-iter CSV doesnt have required columns", ha="center"
-                        )
-                except Exception as e:
-                    self.ax.text(0.5, 0.5, f"Error: {e}", ha="center")
-            else:
+                    df_main = pd.read_csv(csv_path)
+                    runs_needed = int(
+                        df_main.tail(1).to_dict("records")[0].get("runs", 1)
+                    )
+                except:
+                    runs_needed = 1
+
+            if not files:
                 self.ax.text(0.5, 0.5, "There is no per-iter file", ha="center")
+            else:
+                selected = sorted(files, key=os.path.getmtime, reverse=True)[
+                    :runs_needed
+                ]
+                series_list = []
+                used_files = []
+                for p in selected:
+                    try:
+                        dfi = pd.read_csv(p)
+                        if "iter_idx" in dfi.columns and "time_ms" in dfi.columns:
+                            s = dfi.set_index("iter_idx")["time_ms"]
+                            series_list.append(s)
+                            used_files.append(p)
+                        else:
+                            continue
+                    except Exception:
+                        continue
+
+                if not series_list:
+                    self.ax.text(
+                        0.5,
+                        0.5,
+                        "per-iter CSVs don't have required columns (iter_idx, time_ms)",
+                        ha="center",
+                    )
+                else:
+                    df_concat = pd.concat(series_list, axis=1)
+                    mean_series = df_concat.mean(axis=1, skipna=True).sort_index()
+                    self.ax.plot(
+                        mean_series.index, mean_series.values, marker=".", linewidth=1
+                    )
+                    self.ax.set_title(
+                        f"Per-iteration time (mean over {len(used_files)} run(s))"
+                    )
+                    self.ax.set_xlabel("Iteration")
+                    self.ax.set_ylabel("ms")
+                    self.ax.grid(True)
+                    lines.append(
+                        f"Averaged per-iter from {len(used_files)} files (requested {runs_needed})"
+                    )
 
         self.left.delete("1.0", tk.END)
         self.left.insert(tk.END, "\n".join(lines))

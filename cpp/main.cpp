@@ -3,6 +3,10 @@
 #include <omp.h>
 #endif
 
+#define CL_TARGET_OPENCL_VERSION 220
+#include <CL/cl.h>
+#include <CLBlast/clblast.h>  // Assume CLBlast is included via -I path or placed in include dir
+
 struct Args {
     int n_samples = 20000;
     int n_features = 128;
@@ -17,6 +21,7 @@ struct Args {
     int pilot_iters = 5;
     int runs = 1;
     bool log_header_force = false;
+    std::string backend = "openmp";  // "openmp", "cpu", "gpu"
 };
 
 struct Data {
@@ -97,7 +102,11 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--log-header-force") {
             a.log_header_force = true;
         }
-        else { 
+        else if (k == "--backend") {
+            need(i, k, argc);
+            a.backend = argv[++i];
+        }
+        else {
             fprintf(stderr, "Unknown arg: %s\n", k.c_str()); exit(1);
         }
     }
@@ -154,7 +163,8 @@ double compute_loss(const Data& d, const std::vector<double>& w) {
     return sse / N;
 }
 
-double one_iter(Data& d, std::vector<double>& w, double lr, bool need_loss, double* out_loss) {
+// OpenMP version (parallel)
+double one_iter_openmp(Data& d, std::vector<double>& w, double lr, bool need_loss, double* out_loss) {
     auto t0 = std::chrono::high_resolution_clock::now();
     int N = d.N, D = d.D;
 
@@ -191,14 +201,189 @@ double one_iter(Data& d, std::vector<double>& w, double lr, bool need_loss, doub
     return std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
 
-int calibrate_iters(Data& d, std::vector<double>& w, double lr, int pilot, double target) {
+// Single-thread CPU version
+double one_iter_cpu(Data& d, std::vector<double>& w, double lr, bool need_loss, double* out_loss) {
+    auto t0 = std::chrono::high_resolution_clock::now();
+    int N = d.N, D = d.D;
+    std::fill(d.grad.begin(), d.grad.end(), 0.0);
+    double sse = 0.0;
+    for (int i = 0; i < N; ++i) {
+        const double* Xi = &d.X[(size_t)i * D];
+        double pred = 0.0;
+        for (int j = 0; j < D; ++j) pred += Xi[j] * w[j];
+        double ri = pred - d.y[i];
+        if (need_loss) sse += ri * ri;
+        for (int j = 0; j < D; ++j) d.grad[j] += Xi[j] * ri;
+    }
+    double scale = 2.0 / N;
+    for (int j = 0; j < D; ++j) w[j] -= lr * (scale * d.grad[j]);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    if (out_loss) *out_loss = need_loss ? (sse / N) : std::numeric_limits<double>::quiet_NaN();
+    return std::chrono::duration<double, std::milli>(t1 - t0).count();
+}
+
+// GPU version using CLBlast
+double one_iter_gpu(Data& d, std::vector<double>& w, double lr, bool need_loss, double* out_loss) {
+    auto t0 = std::chrono::high_resolution_clock::now();
+
+    static bool initialized = false;
+    static cl_platform_id platform;
+    static cl_device_id device;
+    static cl_context context;
+    static cl_command_queue queue;
+    static cl_mem bufX, bufY, bufW, bufGrad, bufR;
+    static cl_int cl_status;
+
+    int N = d.N, D = d.D;
+
+    if (!initialized) {
+        // Initialize CLBlast
+        clblast::StatusCode blast_status = clblast::Initialize();
+        if (blast_status != clblast::StatusCode::kSuccess) {
+            fprintf(stderr, "CLBlast initialization failed: %d\n", static_cast<int>(blast_status));
+            exit(1);
+        }
+
+        // Find AMD platform
+        cl_uint num_platforms;
+        clGetPlatformIDs(0, nullptr, &num_platforms);
+        std::vector<cl_platform_id> platforms(num_platforms);
+        clGetPlatformIDs(num_platforms, platforms.data(), nullptr);
+
+        bool found = false;
+        for (auto p : platforms) {
+            char name[256];
+            clGetPlatformInfo(p, CL_PLATFORM_NAME, sizeof(name), name, nullptr);
+            std::string pname = name;
+            if (pname.find("AMD") != std::string::npos || pname.find("Advanced Micro Devices") != std::string::npos) {
+                platform = p;
+
+                cl_uint num_devices;
+                clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 0, nullptr, &num_devices);
+                std::vector<cl_device_id> devices(num_devices);
+                clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, num_devices, devices.data(), nullptr);
+
+                for (auto dev : devices) {
+                    char devname[256];
+                    clGetDeviceInfo(dev, CL_DEVICE_NAME, sizeof(devname), devname, nullptr);
+                    std::string dname = devname;
+                    if (dname.find("Vega") != std::string::npos || dname.find("Radeon") != std::string::npos) {
+                        device = dev;
+                        found = true;
+                        break;
+                    }
+                }
+                if (found) break;
+            }
+        }
+        if (!found) {
+            // Fallback to first GPU
+            clGetDeviceIDs(platforms[0], CL_DEVICE_TYPE_GPU, 1, &device, nullptr);
+        }
+
+        context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &cl_status);
+        if (cl_status != CL_SUCCESS) {
+            fprintf(stderr, "clCreateContext failed: %d\n", cl_status);
+            exit(1);
+        }
+
+        queue = clCreateCommandQueue(context, device, 0, &cl_status);
+        if (cl_status != CL_SUCCESS) {
+            fprintf(stderr, "clCreateCommandQueue failed: %d\n", cl_status);
+            exit(1);
+        }
+
+        // Create buffers
+        bufX = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, N * D * sizeof(double), d.X.data(), &cl_status);
+        bufY = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, N * sizeof(double), d.y.data(), &cl_status);
+        bufW = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, D * sizeof(double), w.data(), &cl_status);
+        bufGrad = clCreateBuffer(context, CL_MEM_READ_WRITE, D * sizeof(double), nullptr, &cl_status);
+        bufR = clCreateBuffer(context, CL_MEM_READ_WRITE, N * sizeof(double), nullptr, &cl_status);
+
+        initialized = true;
+    }
+
+    // SCompute predictions:
+    clblast::StatusCode status = clblast::Gemv(clblast::Layout::kRowMajor,
+                                               clblast::Transpose::kNo,
+                                               N, D,
+                                               1.0,
+                                               bufX, 0, D,
+                                               bufW, 0, 1,
+                                               0.0,
+                                               bufR, 0, 1,
+                                               &queue, nullptr);
+    if (status != clblast::StatusCode::kSuccess) {
+        fprintf(stderr, "Gemv (pred) failed: %d\n", static_cast<int>(status));
+    }
+
+    // subtract y from predictions
+    status = clblast::Axpy(N, -1.0, bufY, 0, 1, bufR, 0, 1, &queue, nullptr);
+    if (status != clblast::StatusCode::kSuccess) {
+        fprintf(stderr, "Axpy (subtract y) failed: %d\n", static_cast<int>(status));
+    }
+
+    // Compute gradient
+    status = clblast::Gemv(clblast::Layout::kRowMajor,
+                           clblast::Transpose::kYes,
+                           N, D,
+                           2.0 / N,
+                           bufX, 0, D,
+                           bufR, 0, 1,
+                           0.0,
+                           bufGrad, 0, 1,
+                           &queue, nullptr);
+    if (status != clblast::StatusCode::kSuccess) {
+        fprintf(stderr, "Gemv (grad) failed: %d\n", static_cast<int>(status));
+    }
+
+    // Update w
+    status = clblast::Axpy(D, -lr, bufGrad, 0, 1, bufW, 0, 1, &queue, nullptr);
+    if (status != clblast::StatusCode::kSuccess) {
+        fprintf(stderr, "Axpy (update w) failed: %d\n", static_cast<int>(status));
+    }
+
+    // Read back w to host
+    cl_status = clEnqueueReadBuffer(queue, bufW, CL_TRUE, 0, D * sizeof(double), w.data(), 0, nullptr, nullptr);
+    if (cl_status != CL_SUCCESS) {
+        fprintf(stderr, "Read w failed: %d\n", cl_status);
+    }
+
+    double loss = std::numeric_limits<double>::quiet_NaN();
+    if (need_loss) {
+        // Read residuals to host and compute loss
+        std::vector<double> r_host(N);
+        cl_status = clEnqueueReadBuffer(queue, bufR, CL_TRUE, 0, N * sizeof(double), r_host.data(), 0, nullptr, nullptr);
+        if (cl_status != CL_SUCCESS) {
+            fprintf(stderr, "Read r failed: %d\n", cl_status);
+        }
+        loss = 0.0;
+        for (int i = 0; i < N; ++i) {
+            loss += r_host[i] * r_host[i];
+        }
+        loss /= N;
+    }
+    if (out_loss) *out_loss = loss;
+
+    clFinish(queue);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    return std::chrono::duration<double, std::milli>(t1 - t0).count();
+}
+
+int calibrate_iters(Data& d, std::vector<double>& w, double lr, int pilot, double target, const std::string& backend) {
     if (target <= 0)
         return -1;
     int K = std::max(1, pilot);
     double sum = 0.0;
     for (int k = 0; k < K; ++k) {
         double L;
-        sum += one_iter(d, w, lr, false, &L);
+        if (backend == "gpu") {
+            sum += one_iter_gpu(d, w, lr, false, &L);
+        } else if (backend == "openmp") {
+            sum += one_iter_openmp(d, w, lr, false, &L);
+        } else {
+            sum += one_iter_cpu(d, w, lr, false, &L);
+        }
     }
     double per = sum / K;
     int need = std::max(1, (int)std::ceil((target * 1000.0) / per));
@@ -225,7 +410,8 @@ RunResult run_once(
     int threads,
     const std::string& per_path,
     bool force_header,
-    int run_id
+    int run_id,
+    const std::string& backend
 ) {
     (void)compute_loss(d, w);
     std::ofstream perofs;
@@ -243,7 +429,14 @@ RunResult run_once(
     double last_loss = 0.0;
     for (int t = 0; t < iters; ++t) {
         double L;
-        double ms = one_iter(d, w, lr, !per_path.empty(), &L);
+        double ms;
+        if (backend == "gpu") {
+            ms = one_iter_gpu(d, w, lr, !per_path.empty(), &L);
+        } else if (backend == "openmp") {
+            ms = one_iter_openmp(d, w, lr, !per_path.empty(), &L);
+        } else {
+            ms = one_iter_cpu(d, w, lr, !per_path.empty(), &L);
+        }
         last_loss = L;
         if (perofs.good()) {
             perofs << date << "," << label << "," << threads << "," << d.N << "," << d.D << "," << run_id << "," << t << "," << ms << "," << L << "\n";
@@ -253,7 +446,8 @@ RunResult run_once(
     RunResult rr;
     rr.total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     rr.per_iter_ms = rr.total_ms / iters;
-    rr.final_loss = last_loss; return rr;
+    rr.final_loss = last_loss;
+    return rr;
 }
 
 int main(int argc, char** argv) {
@@ -261,7 +455,7 @@ int main(int argc, char** argv) {
     std::cin.tie(nullptr);
     Args A = parse_args(argc, argv);
 #ifdef _OPENMP
-    if (A.threads > 0)
+    if (A.threads > 0 && A.backend == "openmp")
         omp_set_num_threads(A.threads);
 #endif
     if (A.n_samples <= 0 || A.n_features <= 0 || A.lr <= 0) {
@@ -278,7 +472,7 @@ int main(int argc, char** argv) {
 
     int threads =
 #ifdef _OPENMP
-    (A.threads > 0 ? A.threads : omp_get_max_threads());
+    (A.threads > 0 && A.backend == "openmp" ? A.threads : omp_get_max_threads());
 #else
         1;
 #endif
@@ -286,7 +480,7 @@ int main(int argc, char** argv) {
     int iters = A.iters;
     if (A.target_sec > 0) {
         std::vector<double> wp = w;
-        int need = calibrate_iters(d, wp, A.lr, A.pilot_iters, A.target_sec);
+        int need = calibrate_iters(d, wp, A.lr, A.pilot_iters, A.target_sec, A.backend);
         if (need > 0) {
             iters = need;
             std::fill(w.begin(), w.end(), 0.0);
@@ -310,7 +504,7 @@ int main(int argc, char** argv) {
             }
             per = base + "_run" + std::to_string(run) + ext;
         }
-        RunResult rr = run_once(d, w, A.lr, iters, A.label, threads, per, A.log_header_force, run);
+        RunResult rr = run_once(d, w, A.lr, iters, A.label, threads, per, A.log_header_force, run, A.backend);
         sum_total += rr.total_ms;
         sum_piter += rr.per_iter_ms;
         last_loss = rr.final_loss;
@@ -322,7 +516,7 @@ int main(int argc, char** argv) {
         << avg_total << "," << avg_piter << "," << last_loss << "," << A.runs << "\n";
 
     std::cout << "Done. total_ms_avg=" << avg_total << " per_iter_ms_avg=" << avg_piter << " loss=" << last_loss
-        << " threads=" << threads << " iters=" << iters << " runs=" << A.runs;
+        << " threads=" << threads << " iters=" << iters << " runs=" << A.runs << " backend=" << A.backend;
     if (A.target_sec > 0) std::cout << " (autocalibrated)";
     std::cout << std::endl;
     return 0;

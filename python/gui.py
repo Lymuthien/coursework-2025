@@ -32,7 +32,7 @@ HINTS = {
     "n_features": "D — количество признаков (столбцов).",
     "iters": "T — число итераций (игнорируется, если задана целевая длительность).",
     "lr": "η — шаг обучения градиентного спуска (>0).",
-    "threads": "Число потоков (0 — авто). Введите -1 для режима графика threads→time.",
+    "threads": "Число потоков (0=авто, -1=график).",
     "seed": "Seed генератора случайных чисел.",
     "csv": "Файл агрегированных результатов (results.csv).",
     "per_iter": "Базовое имя per-iter файла; создаются *_runK.csv.",
@@ -304,10 +304,19 @@ class App(tk.Tk):
             if threads_override is not None
             else self.vars["threads"].get().strip()
         )
-        if threads_value and threads_value != "-1":
-            args.extend(["--threads", str(threads_value)])
+        if int(threads_value) == 0:
+            args.extend(["--threads", "0"])
 
         cmd = [bin_path] + args
+
+        env = os.environ.copy()
+        try:
+            num_threads = int(threads_value)
+            if num_threads > 0:
+                env['OMP_NUM_THREADS'] = str(num_threads)
+        except:
+            pass
+
         try:
             proc = subprocess.run(
                 cmd,
@@ -315,6 +324,7 @@ class App(tk.Tk):
                 stderr=subprocess.PIPE,
                 text=True,
                 check=True,
+                env=env
             )
             self.set_status("")
             return True

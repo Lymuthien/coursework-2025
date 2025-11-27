@@ -1,11 +1,23 @@
-#include <bits/stdc++.h>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <random>
+#include <string>
+#include <vector>
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 
 #define CL_TARGET_OPENCL_VERSION 220
 #include <CL/cl.h>
-#include <CLBlast/clblast.h>
+#include <clblast.h>
 
 struct Args {
     int n_samples = 20000;
@@ -25,12 +37,13 @@ struct Args {
 };
 
 struct Data {
-    int N=0, D=0;
+    int N = 0, D = 0;
     std::vector<double> X, y, w, w_true, r, grad;
 };
 
 static inline std::string now_str() {
-    std::time_t now = std::time(nullptr); std::tm tmv;
+    std::time_t now = std::time(nullptr);
+    std::tm tmv;
 #ifdef _WIN32
     localtime_s(&tmv, &now);
 #else
@@ -48,7 +61,7 @@ Args parse_args(int argc, char** argv) {
             fprintf(stderr, "Missing value for %s\n", k.c_str());
             exit(1);
         }
-    };
+        };
     for (int i = 1; i < argc; ++i) {
         std::string k = argv[i];
         if (k == "--n-samples") {
@@ -67,25 +80,25 @@ Args parse_args(int argc, char** argv) {
             need(i, k, argc);
             a.lr = std::stod(argv[++i]);
         }
-        else if (k == "--threads") { 
-            need(i, k, argc); 
+        else if (k == "--threads") {
+            need(i, k, argc);
             a.threads = std::stoi(argv[++i]);
         }
-        else if (k == "--seed") { 
-            need(i, k, argc); 
-            a.seed = std::stoi(argv[++i]); 
+        else if (k == "--seed") {
+            need(i, k, argc);
+            a.seed = std::stoi(argv[++i]);
         }
-        else if (k == "--csv") { 
-            need(i, k, argc); 
+        else if (k == "--csv") {
+            need(i, k, argc);
             a.csv_path = argv[++i];
         }
-        else if (k == "--label") { 
+        else if (k == "--label") {
             need(i, k, argc);
-            a.label = argv[++i]; 
+            a.label = argv[++i];
         }
-        else if (k == "--per-iter-log") { 
-            need(i, k, argc); 
-            a.per_iter_log = argv[++i]; 
+        else if (k == "--per-iter-log") {
+            need(i, k, argc);
+            a.per_iter_log = argv[++i];
         }
         else if (k == "--target-sec") {
             need(i, k, argc);
@@ -95,9 +108,9 @@ Args parse_args(int argc, char** argv) {
             need(i, k, argc);
             a.pilot_iters = std::stoi(argv[++i]);
         }
-        else if (k == "--runs") { 
+        else if (k == "--runs") {
             need(i, k, argc);
-            a.runs = std::stoi(argv[++i]); 
+            a.runs = std::stoi(argv[++i]);
         }
         else if (k == "--log-header-force") {
             a.log_header_force = true;
@@ -107,7 +120,8 @@ Args parse_args(int argc, char** argv) {
             a.backend = argv[++i];
         }
         else {
-            fprintf(stderr, "Unknown arg: %s\n", k.c_str()); exit(1);
+            fprintf(stderr, "Unknown arg: %s\n", k.c_str());
+            exit(1);
         }
     }
     return a;
@@ -118,9 +132,9 @@ static inline int eff_threads(int req) {
     return (req > 0) ? req : omp_get_max_threads();
 }
 #else
-static inline int eff_threads(int req) { 
-    (void)req; 
-    return 1; 
+static inline int eff_threads(int req) {
+    (void)req;
+    return 1;
 }
 #endif
 
@@ -135,8 +149,7 @@ void generate_data(Data& d, int N, int D, int seed) {
     d.grad.assign(D, 0.0);
     std::mt19937_64 rng(seed);
     std::normal_distribution<double> nd(0.0, 1.0);
-    for (int j = 0; j < D; ++j)
-        d.w_true[j] = nd(rng);
+    for (int j = 0; j < D; ++j) d.w_true[j] = nd(rng);
     for (int i = 0; i < N; ++i) {
         double yi = 0.0;
         for (int j = 0; j < D; ++j) {
@@ -155,8 +168,7 @@ double compute_loss(const Data& d, const std::vector<double>& w) {
     for (int i = 0; i < N; ++i) {
         double pred = 0.0;
         const double* Xi = &d.X[(size_t)i * D];
-        for (int j = 0; j < D; ++j)
-            pred += Xi[j] * w[j];
+        for (int j = 0; j < D; ++j) pred += Xi[j] * w[j];
         double diff = pred - d.y[i];
         sse += diff * diff;
     }
@@ -256,15 +268,15 @@ double one_iter_gpu(Data& d, std::vector<double>& w, double lr, bool need_loss, 
         cl_int err;
         context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &err);
         if (err != CL_SUCCESS) {
-            fprintf(stderr, "clCreateContext failed\n"); 
+            fprintf(stderr, "clCreateContext failed\n");
             exit(1);
         }
 
         const cl_queue_properties props[] = { 0 };
         queue = clCreateCommandQueueWithProperties(context, device, props, &err);
-        if (err != CL_SUCCESS) { 
-            fprintf(stderr, "clCreateCommandQueueWithProperties failed\n"); 
-            exit(1); 
+        if (err != CL_SUCCESS) {
+            fprintf(stderr, "clCreateCommandQueueWithProperties failed\n");
+            exit(1);
         }
 
         err = CL_SUCCESS;
@@ -318,7 +330,8 @@ int calibrate_iters(Data& d, std::vector<double>& w, double lr, int pilot, doubl
         double L;
         if (backend == "gpu") {
             sum += one_iter_gpu(d, w, lr, false, &L);
-        } else if (backend == "openmp") {
+        }
+        else if (backend == "openmp") {
             sum += one_iter_openmp(d, w, lr, false, &L);
         }
     }
@@ -369,7 +382,8 @@ RunResult run_once(
         double ms;
         if (backend == "gpu") {
             ms = one_iter_gpu(d, w, lr, !per_path.empty(), &L);
-        } else if (backend == "openmp") {
+        }
+        else if (backend == "openmp") {
             ms = one_iter_openmp(d, w, lr, !per_path.empty(), &L);
         }
         last_loss = L;

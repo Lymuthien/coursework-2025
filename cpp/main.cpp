@@ -5,7 +5,7 @@
 
 #define CL_TARGET_OPENCL_VERSION 220
 #include <CL/cl.h>
-#include <CLBlast/clblast.h>  // Assume CLBlast is included via -I path or placed in include dir
+#include <CLBlast/clblast.h>
 
 struct Args {
     int n_samples = 20000;
@@ -21,7 +21,7 @@ struct Args {
     int pilot_iters = 5;
     int runs = 1;
     bool log_header_force = false;
-    std::string backend = "openmp";  // "openmp", "cpu", "gpu"
+    std::string backend = "openmp";
 };
 
 struct Data {
@@ -176,47 +176,27 @@ double one_iter_openmp(Data& d, std::vector<double>& w, double lr, bool need_los
         std::vector<double> gl(D, 0.0);
         double sse_local = 0.0;
 
-#pragma omp for nowait
+#pragma omp for
         for (int i = 0; i < N; ++i) {
             const double* Xi = &d.X[(size_t)i * D];
             double pred = 0.0;
             for (int j = 0; j < D; ++j) pred += Xi[j] * w[j];
-            double ri = pred - d.y[i];
+            const double ri = pred - d.y[i];
             if (need_loss) sse_local += ri * ri;
             for (int j = 0; j < D; ++j) gl[j] += Xi[j] * ri;
         }
 
-#pragma omp critical
-        {
-            for (int j = 0; j < D; ++j) d.grad[j] += gl[j];
-            sse += sse_local;
+        for (int j = 0; j < D; ++j) {
+#pragma omp atomic
+            d.grad[j] += gl[j];
         }
+#pragma omp atomic
+        sse += sse_local;
     }
 
-    double scale = 2.0 / N;
+    const double scale = 2.0 / N;
     for (int j = 0; j < D; ++j) w[j] -= lr * (scale * d.grad[j]);
 
-    auto t1 = std::chrono::high_resolution_clock::now();
-    if (out_loss) *out_loss = need_loss ? (sse / N) : std::numeric_limits<double>::quiet_NaN();
-    return std::chrono::duration<double, std::milli>(t1 - t0).count();
-}
-
-// Single-thread CPU version
-double one_iter_cpu(Data& d, std::vector<double>& w, double lr, bool need_loss, double* out_loss) {
-    auto t0 = std::chrono::high_resolution_clock::now();
-    int N = d.N, D = d.D;
-    std::fill(d.grad.begin(), d.grad.end(), 0.0);
-    double sse = 0.0;
-    for (int i = 0; i < N; ++i) {
-        const double* Xi = &d.X[(size_t)i * D];
-        double pred = 0.0;
-        for (int j = 0; j < D; ++j) pred += Xi[j] * w[j];
-        double ri = pred - d.y[i];
-        if (need_loss) sse += ri * ri;
-        for (int j = 0; j < D; ++j) d.grad[j] += Xi[j] * ri;
-    }
-    double scale = 2.0 / N;
-    for (int j = 0; j < D; ++j) w[j] -= lr * (scale * d.grad[j]);
     auto t1 = std::chrono::high_resolution_clock::now();
     if (out_loss) *out_loss = need_loss ? (sse / N) : std::numeric_limits<double>::quiet_NaN();
     return std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -259,7 +239,8 @@ double one_iter_gpu(Data& d, std::vector<double>& w, double lr, bool need_loss, 
                     char devname[256];
                     clGetDeviceInfo(dev, CL_DEVICE_NAME, sizeof(devname), devname, nullptr);
                     std::string dname = devname;
-                    if (dname.find("Vega") != std::string::npos || dname.find("Radeon") != std::string::npos || dname.find("Graphics") != std::string::npos) {
+                    if (dname.find("Vega") != std::string::npos || dname.find("Radeon") != std::string::npos
+                        || dname.find("Graphics") != std::string::npos) {
                         device = dev;
                         found = true;
                         break;
@@ -339,8 +320,6 @@ int calibrate_iters(Data& d, std::vector<double>& w, double lr, int pilot, doubl
             sum += one_iter_gpu(d, w, lr, false, &L);
         } else if (backend == "openmp") {
             sum += one_iter_openmp(d, w, lr, false, &L);
-        } else {
-            sum += one_iter_cpu(d, w, lr, false, &L);
         }
     }
     double per = sum / K;
@@ -392,8 +371,6 @@ RunResult run_once(
             ms = one_iter_gpu(d, w, lr, !per_path.empty(), &L);
         } else if (backend == "openmp") {
             ms = one_iter_openmp(d, w, lr, !per_path.empty(), &L);
-        } else {
-            ms = one_iter_cpu(d, w, lr, !per_path.empty(), &L);
         }
         last_loss = L;
         if (perofs.good()) {

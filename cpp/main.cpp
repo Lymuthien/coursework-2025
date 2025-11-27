@@ -227,23 +227,15 @@ double one_iter_gpu(Data& d, std::vector<double>& w, double lr, bool need_loss, 
     auto t0 = std::chrono::high_resolution_clock::now();
 
     static bool initialized = false;
-    static cl_platform_id platform;
-    static cl_device_id device;
-    static cl_context context;
-    static cl_command_queue queue;
-    static cl_mem bufX, bufY, bufW, bufGrad, bufR;
-    static cl_int cl_status;
+    static cl_platform_id platform = nullptr;
+    static cl_device_id device = nullptr;
+    static cl_context context = nullptr;
+    static cl_command_queue queue = nullptr;
+    static cl_mem bufX = nullptr, bufY = nullptr, bufW = nullptr, bufGrad = nullptr, bufR = nullptr;
 
     int N = d.N, D = d.D;
 
     if (!initialized) {
-        // Initialize CLBlast
-        clblast::StatusCode blast_status = clblast::Initialize();
-        if (blast_status != clblast::StatusCode::kSuccess) {
-            fprintf(stderr, "CLBlast initialization failed: %d\n", static_cast<int>(blast_status));
-            exit(1);
-        }
-
         // Find AMD platform
         cl_uint num_platforms;
         clGetPlatformIDs(0, nullptr, &num_platforms);
@@ -255,7 +247,7 @@ double one_iter_gpu(Data& d, std::vector<double>& w, double lr, bool need_loss, 
             char name[256];
             clGetPlatformInfo(p, CL_PLATFORM_NAME, sizeof(name), name, nullptr);
             std::string pname = name;
-            if (pname.find("AMD") != std::string::npos || pname.find("Advanced Micro Devices") != std::string::npos) {
+            if (pname.find("AMD") != std::string::npos) {
                 platform = p;
 
                 cl_uint num_devices;
@@ -267,7 +259,7 @@ double one_iter_gpu(Data& d, std::vector<double>& w, double lr, bool need_loss, 
                     char devname[256];
                     clGetDeviceInfo(dev, CL_DEVICE_NAME, sizeof(devname), devname, nullptr);
                     std::string dname = devname;
-                    if (dname.find("Vega") != std::string::npos || dname.find("Radeon") != std::string::npos) {
+                    if (dname.find("Vega") != std::string::npos || dname.find("Radeon") != std::string::npos || dname.find("Graphics") != std::string::npos) {
                         device = dev;
                         found = true;
                         break;
@@ -276,94 +268,60 @@ double one_iter_gpu(Data& d, std::vector<double>& w, double lr, bool need_loss, 
                 if (found) break;
             }
         }
-        if (!found) {
-            // Fallback to first GPU
+        if (!found && num_platforms > 0) {
             clGetDeviceIDs(platforms[0], CL_DEVICE_TYPE_GPU, 1, &device, nullptr);
         }
 
-        context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &cl_status);
-        if (cl_status != CL_SUCCESS) {
-            fprintf(stderr, "clCreateContext failed: %d\n", cl_status);
+        cl_int err;
+        context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &err);
+        if (err != CL_SUCCESS) {
+            fprintf(stderr, "clCreateContext failed\n"); 
             exit(1);
         }
 
-        queue = clCreateCommandQueue(context, device, 0, &cl_status);
-        if (cl_status != CL_SUCCESS) {
-            fprintf(stderr, "clCreateCommandQueue failed: %d\n", cl_status);
-            exit(1);
+        const cl_queue_properties props[] = { 0 };
+        queue = clCreateCommandQueueWithProperties(context, device, props, &err);
+        if (err != CL_SUCCESS) { 
+            fprintf(stderr, "clCreateCommandQueueWithProperties failed\n"); 
+            exit(1); 
         }
 
-        // Create buffers
-        bufX = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, N * D * sizeof(double), d.X.data(), &cl_status);
-        bufY = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, N * sizeof(double), d.y.data(), &cl_status);
-        bufW = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, D * sizeof(double), w.data(), &cl_status);
-        bufGrad = clCreateBuffer(context, CL_MEM_READ_WRITE, D * sizeof(double), nullptr, &cl_status);
-        bufR = clCreateBuffer(context, CL_MEM_READ_WRITE, N * sizeof(double), nullptr, &cl_status);
+        err = CL_SUCCESS;
+        bufX = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, N * D * sizeof(double), d.X.data(), &err);
+        bufY = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, N * sizeof(double), d.y.data(), &err);
+        bufW = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, D * sizeof(double), w.data(), &err);
+        bufGrad = clCreateBuffer(context, CL_MEM_WRITE_ONLY, D * sizeof(double), nullptr, &err);
+        bufR = clCreateBuffer(context, CL_MEM_READ_WRITE, N * sizeof(double), nullptr, &err);
+
+        char name[128];
+        clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(name), name, nullptr);
+        printf("Using GPU: %s\n", name);
 
         initialized = true;
     }
 
-    // SCompute predictions:
-    clblast::StatusCode status = clblast::Gemv(clblast::Layout::kRowMajor,
-                                               clblast::Transpose::kNo,
-                                               N, D,
-                                               1.0,
-                                               bufX, 0, D,
-                                               bufW, 0, 1,
-                                               0.0,
-                                               bufR, 0, 1,
-                                               &queue, nullptr);
-    if (status != clblast::StatusCode::kSuccess) {
-        fprintf(stderr, "Gemv (pred) failed: %d\n", static_cast<int>(status));
-    }
+    clblast::StatusCode status;
 
-    // subtract y from predictions
+    status = clblast::Gemv(clblast::Layout::kRowMajor, clblast::Transpose::kNo,
+        N, D, 1.0, bufX, 0, D, bufW, 0, 1, 0.0, bufR, 0, 1, &queue, nullptr);
+
     status = clblast::Axpy(N, -1.0, bufY, 0, 1, bufR, 0, 1, &queue, nullptr);
-    if (status != clblast::StatusCode::kSuccess) {
-        fprintf(stderr, "Axpy (subtract y) failed: %d\n", static_cast<int>(status));
-    }
 
-    // Compute gradient
-    status = clblast::Gemv(clblast::Layout::kRowMajor,
-                           clblast::Transpose::kYes,
-                           N, D,
-                           2.0 / N,
-                           bufX, 0, D,
-                           bufR, 0, 1,
-                           0.0,
-                           bufGrad, 0, 1,
-                           &queue, nullptr);
-    if (status != clblast::StatusCode::kSuccess) {
-        fprintf(stderr, "Gemv (grad) failed: %d\n", static_cast<int>(status));
-    }
+    status = clblast::Gemv(clblast::Layout::kRowMajor, clblast::Transpose::kYes,
+        D, N, 2.0 / N, bufX, 0, D, bufR, 0, 1, 0.0, bufGrad, 0, 1, &queue, nullptr);
 
-    // Update w
     status = clblast::Axpy(D, -lr, bufGrad, 0, 1, bufW, 0, 1, &queue, nullptr);
-    if (status != clblast::StatusCode::kSuccess) {
-        fprintf(stderr, "Axpy (update w) failed: %d\n", static_cast<int>(status));
-    }
 
-    // Read back w to host
-    cl_status = clEnqueueReadBuffer(queue, bufW, CL_TRUE, 0, D * sizeof(double), w.data(), 0, nullptr, nullptr);
-    if (cl_status != CL_SUCCESS) {
-        fprintf(stderr, "Read w failed: %d\n", cl_status);
-    }
+    clEnqueueReadBuffer(queue, bufW, CL_TRUE, 0, D * sizeof(double), w.data(), 0, nullptr, nullptr);
 
-    double loss = std::numeric_limits<double>::quiet_NaN();
+    double loss = 0.0;
     if (need_loss) {
-        // Read residuals to host and compute loss
-        std::vector<double> r_host(N);
-        cl_status = clEnqueueReadBuffer(queue, bufR, CL_TRUE, 0, N * sizeof(double), r_host.data(), 0, nullptr, nullptr);
-        if (cl_status != CL_SUCCESS) {
-            fprintf(stderr, "Read r failed: %d\n", cl_status);
-        }
-        loss = 0.0;
-        for (int i = 0; i < N; ++i) {
-            loss += r_host[i] * r_host[i];
-        }
+        std::vector<double> r(N);
+        clEnqueueReadBuffer(queue, bufR, CL_TRUE, 0, N * sizeof(double), r.data(), 0, nullptr, nullptr);
+        for (double v : r) loss += v * v;
         loss /= N;
+        if (out_loss) *out_loss = loss;
     }
-    if (out_loss) *out_loss = loss;
 
     clFinish(queue);
     auto t1 = std::chrono::high_resolution_clock::now();

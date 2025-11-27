@@ -1,4 +1,7 @@
-import os, sys, subprocess, glob
+import os
+import sys
+import subprocess
+import glob
 import tkinter as tk
 from tkinter import ttk, filedialog
 
@@ -28,31 +31,33 @@ PER_DIR_DEFAULT = os.path.abspath(
 HINTS = {
     "binary": "Исполняемый файл бенчмарка C++ (gd_bench).",
     "label": "Метка прогона/процессора. Попадёт в CSV и заголовки графиков.",
+    "backend": "Режим выполнения: cpu — один поток, openmp — многопоточный CPU, gpu — встроенный gpu",
     "n_samples": "N — количество наблюдений (строк выборки).",
     "n_features": "D — количество признаков (столбцов).",
     "iters": "T — число итераций (игнорируется, если задана целевая длительность).",
     "lr": "η — шаг обучения градиентного спуска (>0).",
-    "threads": "Число потоков (0=авто, -1=график).",
+    "threads": "Потоки OpenMP (0=авто, -1=свип по потокам).",
     "seed": "Seed генератора случайных чисел.",
     "csv": "Файл агрегированных результатов (results.csv).",
     "per_iter": "Базовое имя per-iter файла; создаются *_runK.csv.",
-    "target_sec": "Целевая длительность (сек). 0 — не использовать.",
-    "pilot_iters": "Пилот — короткий предварительный прогон (k итераций) для оценки времени одной итерации.",
-    "runs": "Повторы теста (усреднение времён).",
+    "target_sec": "Целевая длительность прогона (сек). 0 — не использовать.",
+    "pilot_iters": "Пилот — короткий прогон для оценки времени одной итерации.",
+    "runs": "Количество повторов теста (усреднение).",
 }
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Benchmark GUI")
-        try:
-            if os.name == "nt":
+        self.title("GD Benchmark GUI")
+        if os.name == "nt":
+            try:
                 self.state("zoomed")
-            else:
-                self.attributes("-zoomed", True)
-        except Exception:
-            self.attributes("-fullscreen", True)
+            except:
+                pass
+        else:
+            self.attributes("-zoomed", True)
+
         self.style_setup()
         self.build()
 
@@ -65,154 +70,171 @@ class App(tk.Tk):
 
         style.configure("TLabel", font=("Segoe UI", 10))
         style.configure("TButton", font=("Segoe UI", 10, "bold"))
-        style.configure("Header.TLabel", font=("Segoe UI", 12, "bold"))
-        style.configure("Hint.TLabel", foreground="#666666", font=("Segoe UI", 9))
+        style.configure("Header.TLabel", font=("Segoe UI", 14, "bold"))
+        style.configure("Hint.TLabel", foreground="#555555", font=("Segoe UI", 9))
         style.configure("Error.TLabel", foreground="#c62828", font=("Segoe UI", 9))
 
     def build(self):
-        root = ttk.Frame(self, padding=10)
+        root = ttk.Frame(self, padding=12)
         root.pack(fill="both", expand=True)
 
-        ttk.Label(root, text="Gradial descent algorithm", style="Header.TLabel").pack(
-            anchor="w", pady=(0, 6)
+        ttk.Label(root, text="Gradient Descent Benchmark", style="Header.TLabel").pack(
+            anchor="w", pady=(0, 10)
         )
 
         self.status = ttk.Label(root, text="", style="Error.TLabel")
-        self.status.pack(anchor="w", pady=(0, 6))
+        self.status.pack(anchor="w", pady=(0, 8))
 
         body = ttk.Frame(root)
         body.pack(fill="both", expand=True)
 
-        row = self.set_form(body)
-        buttons = self.set_buttons(row)
+        self.set_form(body)
         self.set_result_panel(body)
 
-    def set_form(self, body):
-        self.form = ttk.Frame(body)
-        self.form.pack(side="top", fill="x")
+    def set_form(self, parent):
+        self.form = ttk.Frame(parent)
+        self.form.pack(side="top", fill="x", pady=(0, 10))
 
         self.vars = {}
         self.errs = {}
         self.hints = {}
+
         fields = [
             ("binary", "Бинарник C++", BIN_DEFAULT),
-            ("label", "Метка CPU/прогона", "CPU"),
-            ("n_samples", "N (>0)", "20000"),
-            ("n_features", "D (>0)", "128"),
-            ("iters", "T (>0, игнор при target)", "50"),
-            ("lr", "η (>0)", "1e-3"),
+            ("label", "Метка прогона", "CPU"),
+            ("backend", "Backend", "openmp"),
+            ("n_samples", "N (строк)", "20000"),
+            ("n_features", "D (признаков)", "128"),
+            ("iters", "Итераций (игнор при target)", "50"),
+            ("lr", "Learning rate η", "1e-3"),
             ("threads", "Потоки (0=авто, -1=график)", "0"),
             ("seed", "Seed", "42"),
             ("csv", "results.csv", CSV_DEFAULT),
             ("per_iter", "per-iter база", os.path.join(PER_DIR_DEFAULT, "session.csv")),
-            ("target_sec", "Цель (сек, >=0)", "0"),
-            ("pilot_iters", "Пилот (k>0)", "5"),
-            ("runs", "Повторы (>=1)", "1"),
+            ("target_sec", "Цель (сек)", "0"),
+            ("pilot_iters", "Пилот (итераций)", "5"),
+            ("runs", "Повторов", "1"),
         ]
 
         self.form.columnconfigure(1, weight=1)
 
-        r = 0
-        for key, label, default in fields:
-            ttk.Label(self.form, text=label).grid(
-                row=r, column=0, sticky="w", padx=6, pady=4
+        row = 0
+        for key, label_text, default in fields:
+            ttk.Label(self.form, text=label_text).grid(
+                row=row, column=0, sticky="w", padx=6, pady=4
             )
 
             var = tk.StringVar(value=str(default))
             self.vars[key] = var
 
-            ent = ttk.Entry(self.form, textvariable=var, width=48)
-            ent.grid(row=r, column=1, sticky="ew", padx=6, pady=4)
+            if key == "backend":
+                frame = ttk.Frame(self.form)
+                frame.grid(row=row, column=1, sticky="ew", padx=6, pady=4)
+                combo = ttk.Combobox(
+                    frame,
+                    textvariable=var,
+                    values=["openmp", "cpu", "gpu"],
+                    state="readonly",
+                    width=12,
+                    font=("Segoe UI", 10),
+                )
+                combo.pack(side="left")
+                ttk.Label(
+                    frame,
+                    text="← cpu / openmp / gpu",
+                    foreground="#1976d2",
+                    font=("Segoe UI", 9, "italic"),
+                ).pack(side="left", padx=(8, 0))
+            else:
+                ent = ttk.Entry(
+                    self.form, textvariable=var, width=48, font=("Consolas", 10)
+                )
+                ent.grid(row=row, column=1, sticky="ew", padx=6, pady=4)
 
             err = ttk.Label(self.form, text="", style="Error.TLabel")
-            err.grid(row=r, column=2, sticky="w", padx=6)
+            err.grid(row=row, column=2, sticky="w", padx=6)
 
             hint = ttk.Label(self.form, text=HINTS.get(key, ""), style="Hint.TLabel")
-            hint.grid(row=r, column=3, sticky="w", padx=6)
+            hint.grid(row=row, column=3, sticky="w", padx=6)
 
             self.errs[key] = err
             self.hints[key] = hint
-            r += 1
+            row += 1
 
-        return r
-
-    def set_result_panel(self, body):
-        self.panel = ttk.Frame(body)
-        self.panel.pack(side="top", fill="both", expand=True, pady=(8, 0))
-        right = ttk.Frame(self.panel)
-        right.pack(fill="both", expand=True)
-
-        self.left = tk.Text(right, width=58, font=("Consolas", 10))
-        self.left.pack(side="left", fill="y", padx=(0, 8), pady=6)
-
-        self.fig = plt.Figure(figsize=(7, 4), dpi=100)
-        self.ax = self.fig.add_subplot(111)
-        self.canvas = FigureCanvasTkAgg(self.fig, master=right)
-        self.canvas.get_tk_widget().pack(side="left", fill="both", expand=True, pady=6)
-
-    def set_buttons(self, row):
         btns = ttk.Frame(self.form)
-        btns.grid(row=row, column=0, columnspan=4, sticky="ew", pady=8)
-        ttk.Button(btns, text="Выбрать бинарник…", command=self.choose_bin).pack(
-            side="left", padx=4
+        btns.grid(row=row, column=0, columnspan=4, sticky="ew", pady=12)
+        btns.columnconfigure(3, weight=1)
+
+        ttk.Button(btns, text="Бинарный файл…", command=self.choose_bin).grid(
+            row=0, column=0, padx=4
         )
-        ttk.Button(btns, text="Выбрать results.csv…", command=self.choose_csv).pack(
-            side="left", padx=4
+        ttk.Button(btns, text="results.csv…", command=self.choose_csv).grid(
+            row=0, column=1, padx=4
         )
-        ttk.Button(btns, text="Выбрать per-iter…", command=self.choose_per).pack(
-            side="left", padx=4
+        ttk.Button(btns, text="per-iter…", command=self.choose_per).grid(
+            row=0, column=2, padx=4
         )
-        ttk.Button(btns, text="Запустить", command=self.on_run).pack(
-            side="right", padx=4
+        ttk.Button(btns, text="Запустить", command=self.on_run, style="TButton").grid(
+            row=0, column=3, sticky="e", padx=4
         )
 
-        return btns
+    def set_result_panel(self, parent):
+        panel = ttk.Frame(parent)
+        panel.pack(side="top", fill="both", expand=True)
+
+        left = tk.Text(panel, width=68, height=20, font=("Consolas", 10), bg="#fafafa")
+        left.pack(side="left", fill="y", padx=(0, 8))
+
+        fig = plt.Figure(figsize=(8, 5), dpi=100)
+        ax = fig.add_subplot(111)
+        canvas = FigureCanvasTkAgg(fig, master=panel)
+        canvas.get_tk_widget().pack(side="right", fill="both", expand=True)
+
+        self.left_text = left
+        self.fig = fig
+        self.ax = ax
+        self.canvas = canvas
+
+    def choose_bin(self):
+        fn = filedialog.askopenfilename(
+            title="Выберите gd_bench.exe",
+            filetypes=[("Executable", "*.exe *.out"), ("All", "*")],
+        )
+        if fn:
+            self.vars["binary"].set(fn)
+
+    def choose_csv(self):
+        fn = filedialog.asksaveasfilename(
+            title="results.csv", defaultextension=".csv", filetypes=[("CSV", "*.csv")]
+        )
+        if fn:
+            self.vars["csv"].set(fn)
+
+    def choose_per(self):
+        fn = filedialog.asksaveasfilename(
+            title="Базовое имя per-iter",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+        )
+        if fn:
+            self.vars["per_iter"].set(fn)
 
     def set_status(self, msg):
         self.status.config(text=msg)
+        self.update_idletasks()
 
-    def choose_bin(self):
-        try:
-            fn = filedialog.askopenfilename(title="gd_bench(.exe)")
-            if fn:
-                self.vars["binary"].set(fn)
-        except Exception as e:
-            self.set_status(f"Error: {e}")
-
-    def choose_csv(self):
-        try:
-            fn = filedialog.asksaveasfilename(
-                title="results.csv", defaultextension=".csv"
-            )
-            if fn:
-                self.vars["csv"].set(fn)
-        except Exception as e:
-            self.set_status(f"Error: {e}")
-
-    def choose_per(self):
-        try:
-            fn = filedialog.asksaveasfilename(
-                title="per-iter base", defaultextension=".csv"
-            )
-            if fn:
-                self.vars["per_iter"].set(fn)
-        except Exception as e:
-            self.set_status(f"Error: {e}")
-
-    # validation
     def _ok_int(self, name, positive=True, allow_zero=False, allow_minus_one=False):
         v = self.vars[name].get().strip()
         if not v:
-            self.errs[name].config(text="Empty. Default value is enable.")
             return True
         try:
             iv = int(v)
             if allow_minus_one and iv == -1:
                 return True
-            if allow_zero and iv < 0:
-                raise ValueError("Number must be non-negative.")
+            if not positive and iv < 0 and not allow_zero:
+                raise ValueError("Отрицательное недопустимо")
             if positive and iv <= 0:
-                raise ValueError("Number must be positive.")
+                raise ValueError("Должно быть >0")
             self.errs[name].config(text="")
             return True
         except ValueError as e:
@@ -222,27 +244,25 @@ class App(tk.Tk):
     def _ok_float_pos(self, name):
         v = self.vars[name].get().strip()
         if not v:
-            self.errs[name].config(text="Empty. Default value is enable.")
             return True
         try:
             fv = float(v)
             if fv <= 0:
-                raise ValueError("Number must be positive.")
+                raise ValueError("Должно быть >0")
             self.errs[name].config(text="")
             return True
         except ValueError as e:
-            self.errs[name].config(text=str(e))
+            self.errs[name].config(text="Некорректное число")
             return False
 
     def validate(self):
         ok = True
-
-        for k in ["binary", "label", "csv", "per_iter"]:
-            if not self.vars[k].get().strip():
-                self.errs[k].config(text="Enter value")
+        for key in ("binary", "label", "csv", "per_iter"):
+            if not self.vars[key].get().strip():
+                self.errs[key].config(text="Обязательно")
                 ok = False
             else:
-                self.errs[k].config(text="")
+                self.errs[key].config(text="")
 
         for name in ["n_samples", "n_features", "iters", "seed", "pilot_iters", "runs"]:
             ok &= self._ok_int(name)
@@ -254,68 +274,55 @@ class App(tk.Tk):
 
         return ok
 
-    # run single
     def run_gd(self, threads_override=None):
         bin_path = self.vars["binary"].get().strip()
-        if not os.path.exists(bin_path):
-            self.set_status("Binary file not found")
+        if not os.path.isfile(bin_path):
+            self.set_status("Бинарный файл не найден")
             return False
 
         args = []
 
-        def add(n, flag):
-            v = self.vars[n].get().strip()
+        def add(key, flag):
+            v = self.vars[key].get().strip()
             if v:
                 args.extend([flag, v])
 
-        for n, flag in [
+        for key, flag in [
             ("n_samples", "--n-samples"),
             ("n_features", "--n-features"),
             ("iters", "--iters"),
             ("lr", "--lr"),
             ("seed", "--seed"),
             ("label", "--label"),
+            ("backend", "--backend"),
             ("target_sec", "--target-sec"),
             ("pilot_iters", "--pilot-iters"),
             ("runs", "--runs"),
         ]:
-            add(n, flag)
+            add(key, flag)
 
-        def check_path(path, name):
-            try:
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-            except Exception as e:
-                self.set_status(f"Error {name} path: {e}")
-                return False
-            return True
-
+        # CSV и per-iter
         csv_path = self.vars["csv"].get().strip()
-        if not check_path(csv_path, "csv"):
-            return False
-        args.extend(["--csv", csv_path])
+        per_path = self.vars["per_iter"].get().strip()
+        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+        os.makedirs(os.path.dirname(per_path), exist_ok=True)
 
-        per = self.vars["per_iter"].get().strip()
-        if not check_path(per, "per-iter"):
-            return False
-        args.extend(["--per-iter-log", per])
+        args += ["--csv", csv_path]
+        args += ["--per-iter-log", per_path]
 
-        threads_value = (
+        threads_val = (
             threads_override
             if threads_override is not None
             else self.vars["threads"].get().strip()
         )
-        if int(threads_value) == 0:
-            args.extend(["--threads", "0"])
+        if threads_val and int(threads_val) != 0:
+            args += ["--threads", str(threads_val)]
 
         cmd = [bin_path] + args
 
         env = os.environ.copy()
-        try:
-            num_threads = int(threads_value)
-            if num_threads > 0:
-                env['OMP_NUM_THREADS'] = str(num_threads)
-        except:
-            pass
+        if threads_val and int(threads_val) > 0:
+            env["OMP_NUM_THREADS"] = str(threads_val)
 
         try:
             proc = subprocess.run(
@@ -323,170 +330,120 @@ class App(tk.Tk):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                check=True,
-                env=env
+                env=env,
+                timeout=600,
             )
-            self.set_status("")
+            if proc.returncode != 0:
+                self.set_status(f"Ошибка: {proc.stderr.strip()[-200:]}")
+                return False
+            self.set_status("Готово")
             return True
-        except subprocess.CalledProcessError as e:
-            self.set_status(f"Run error: {e.stderr or e.stdout}")
-            return False
         except Exception as e:
-            self.set_status(f"Unexpected error: {e}")
+            self.set_status(f"Исключение: {e}")
             return False
 
-    def update_left_and_plot(self, sweep_mode=False):
+    def sweep_threads(self):
+        max_t = (os.cpu_count() or 16) + 2
+        return [1, 2, 4, 6, 8, 12, 16, 20, 24][:max_t]
+
+    def run_sweep_threads(self):
+        vals = self.sweep_threads()
+        any_ok = False
+        for t in vals:
+            self.set_status(f"Запуск threads={t} …")
+            self.update_idletasks()
+            ok = self.run_gd(threads_override=t)
+            any_ok = any_ok or ok
+        if any_ok:
+            self.set_status("Свип завершён")
+        self.update_results(sweep=True)
+
+    def update_results(self, sweep=False):
         lines = []
         csv_path = self.vars["csv"].get().strip()
         try:
             df = pd.read_csv(csv_path)
-            if sweep_mode:
-                tail = df.tail(min(200, len(df)))
-                lines.append("Last results:")
-                for rec in tail.tail(6).to_dict("records"):
-                    lines.append(str(rec))
-            else:
-                last = df.tail(1).to_dict("records")[0]
-                for k in [
-                    "date",
-                    "lang",
-                    "cpu_label",
-                    "n_samples",
-                    "n_features",
-                    "iters",
-                    "lr",
-                    "threads",
-                    "time_ms_total",
-                    "time_ms_per_iter",
-                    "loss_final",
-                    "runs",
-                ]:
-                    if k in last:
-                        lines.append(f"{k}: {last[k]}")
+            last = df.iloc[-1]
+            for col in df.columns:
+                lines.append(f"{col}: {last[col]}")
         except Exception as e:
-            lines.append(f"Cant read results.csv: {e}")
-
-        base = os.path.splitext(self.vars["per_iter"].get().strip())[0]
-        files = glob.glob(base + "_run*.csv")
+            lines.append(f"Не удалось открыть {csv_path}: {e}")
 
         self.ax.clear()
 
-        if sweep_mode:
+        if sweep:
             try:
                 df = pd.read_csv(csv_path)
-                tail = df.tail(min(16, len(df)))
-                if "threads" in tail.columns and "time_ms_total" in tail.columns:
-                    g = (
-                        tail.groupby("threads", as_index=False)["time_ms_total"]
-                        .mean()
-                        .sort_values("threads")
-                    )
-                    self.ax.plot(g["threads"], g["time_ms_total"], marker="o")
-                    self.ax.set_title("Total time by threads")
-                    self.ax.set_xlabel("Threads")
-                    self.ax.set_ylabel("Total time, ms")
-                    self.ax.grid(True)
-                else:
-                    self.ax.text(0.5, 0.5, "No data for threads→time", ha="center")
-            except Exception as e:
-                self.ax.text(0.5, 0.5, f"Error: {e}", ha="center")
-        else:
-            try:
-                runs_needed = int(self.vars["runs"].get())
+                g = df.groupby("threads")["time_ms_total"].mean().reset_index()
+                self.ax.plot(g["threads"], g["time_ms_total"], "o-", color="#1976d2")
+                self.ax.set_xlabel("Потоков")
+                self.ax.set_ylabel("Время всего, мс")
+                self.ax.set_title("Зависимость времени от числа потоков")
+                self.ax.grid(True)
             except:
+                self.ax.text(
+                    0.5,
+                    0.5,
+                    "Нет данных для графика",
+                    ha="center",
+                    va="center",
+                    transform=self.ax.transAxes,
+                )
+        else:
+            base = os.path.splitext(self.vars["per_iter"].get().strip())[0]
+            files = sorted(
+                glob.glob(base + "_run*.csv"), key=os.path.getmtime, reverse=True
+            )
+            try:
+                runs = int(self.vars["runs"].get() or 1)
+            except:
+                runs = 1
+            files = files[:runs]
+
+            series = []
+            for f in files:
                 try:
-                    df_main = pd.read_csv(csv_path)
-                    runs_needed = int(
-                        df_main.tail(1).to_dict("records")[0].get("runs", 1)
-                    )
+                    d = pd.read_csv(f)
+                    if "iter_idx" in d.columns and "time_ms" in d.columns:
+                        series.append(d.set_index("iter_idx")["time_ms"])
                 except:
-                    runs_needed = 1
+                    continue
 
-            if not files:
-                self.ax.text(0.5, 0.5, "There is no per-iter file", ha="center")
+            if series:
+                concat = pd.concat(series, axis=1)
+                median = concat.median(axis=1)
+                self.ax.plot(median.index, median.values, ".-", color="#2e7d32")
+                self.ax.set_xlabel("Итерация")
+                self.ax.set_ylabel("Время итерации, мс")
+                self.ax.set_title(f"Per-iter время (медиана по {len(series)} запускам)")
+                self.ax.grid(True)
+                lines.append(
+                    f"Медиана per-iter: {np.median([s.mean() for s in series]):.2f} мс"
+                )
             else:
-                selected = sorted(files, key=os.path.getmtime, reverse=True)[
-                    :runs_needed
-                ]
-                series_list = []
-                used_files = []
-                means = []
-                for p in selected:
-                    try:
-                        dfi = pd.read_csv(p)
-                        if "iter_idx" in dfi.columns and "time_ms" in dfi.columns:
-                            s = dfi.set_index("iter_idx")["time_ms"]
-                            means.append(s.mean())
-                            series_list.append(s)
-                            used_files.append(p)
-                        else:
-                            continue
-                    except Exception:
-                        continue
+                self.ax.text(
+                    0.5,
+                    0.5,
+                    "per-iter файлы не найдены",
+                    ha="center",
+                    va="center",
+                    transform=self.ax.transAxes,
+                )
 
-                if not series_list:
-                    self.ax.text(
-                        0.5,
-                        0.5,
-                        "per-iter CSVs don't have required columns (iter_idx, time_ms)",
-                        ha="center",
-                    )
-                else:
-                    df_concat = pd.concat(series_list, axis=1)
-                    mean_series = df_concat.median(axis=1, skipna=True).sort_index()
-                    self.ax.plot(
-                        mean_series.index, mean_series.values, marker=".", linewidth=1
-                    )
-                    self.ax.set_title(
-                        f"Per-iteration time (mean over {len(used_files)} run(s))"
-                    )
-                    self.ax.set_xlabel("Iteration")
-                    self.ax.set_ylabel("ms")
-                    self.ax.grid(True)
-                    lines.append(
-                        f"Averaged per-iter from {len(used_files)} files (requested {runs_needed})"
-                    )
-                    lines.append(f"Median per-iter time: {np.median(means)}")
-
-        self.left.delete("1.0", tk.END)
-        self.left.insert(tk.END, "\n".join(lines))
+        self.left_text.delete("1.0", tk.END)
+        self.left_text.insert(tk.END, "\n".join(lines))
         self.canvas.draw()
-
-    def sweep_threads_values(self):
-        max_t = os.cpu_count() or 16
-        vals = []
-        for t in range(1, max_t + 1):
-            vals.append(t)
-
-        return sorted(set(vals))
-
-    def run_sweep_threads(self):
-        vals = self.sweep_threads_values()
-        if not vals:
-            self.set_status("Can not define threads")
-            return
-        ok_any = False
-        for t in vals:
-            self.set_status(f"Running for threads={t}…")
-            self.update_idletasks()
-            ok = self.run_gd(threads_override=t)
-            ok_any = ok_any or ok
-            if not ok:
-                self.errs["threads"].config(text=f"Error for threads={t}")
-        if ok_any:
-            self.set_status("Done")
-        self.update_left_and_plot(sweep_mode=True)
 
     def on_run(self):
         if not self.validate():
-            self.set_status("Incorrect values")
+            self.set_status("Исправьте ошибки в параметрах")
             return
+
         if self.vars["threads"].get().strip() == "-1":
             self.run_sweep_threads()
         else:
-            ok = self.run_gd()
-            if ok:
-                self.update_left_and_plot(sweep_mode=False)
+            if self.run_gd():
+                self.update_results(sweep=False)
 
 
 if __name__ == "__main__":
